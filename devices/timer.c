@@ -120,7 +120,6 @@ timer_nsleep (int64_t ns)
 {
     real_time_sleep (ns, 1000 * 1000 * 1000);
 }
-
 /* Busy-waits for approximately MS milliseconds.  Interrupts need
    not be turned on.
 
@@ -172,12 +171,11 @@ static void
 timer_interrupt (struct intr_frame *args UNUSED)
 {
     ticks++;
-    thread_tick ();
-
     
-    if (get_next_tick_to_wakeup() <= ticks) {
+    if (ticks >= get_next_tick_to_wakeup ()) {
       thread_wakeup(ticks); 
     }
+    thread_tick();
 }
 
 /* Returns true if LOOPS iterations waits for more than one timer

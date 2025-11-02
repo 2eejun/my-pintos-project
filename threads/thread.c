@@ -24,6 +24,8 @@
    that are ready to run but not actually running. */
 static struct list ready_list;
 
+static struct list mlfqs_ready_list[3];
+
 /* List of all processes.  Processes are added to this list
    when they are first scheduled and removed when they exit. */
 static struct list all_list;
@@ -98,6 +100,10 @@ thread_init (void)
     list_init (&all_list);
     list_init (&sleep_list);
 
+    list_init (&mlfqs_ready_list[0]);
+    list_init (&mlfqs_ready_list[1]);
+    list_init (&mlfqs_ready_list[2]);
+
     /* Set up a thread structure for the running thread. */
     initial_thread = running_thread ();
     init_thread (initial_thread, "main", PRI_DEFAULT);
@@ -142,6 +148,8 @@ thread_tick (void)
     /* Enforce preemption. */
     if (++thread_ticks >= TIME_SLICE)
         intr_yield_on_return ();
+    if(!list_empty (&ready_list))
+        thread_aging();
 }
 
 /* Prints thread statistics. */
@@ -213,6 +221,7 @@ thread_create (const char *name, int priority,
 
     /* Add to run queue. */
     thread_unblock (t);
+    check_preemption();
 
     return tid;
 }
@@ -250,11 +259,17 @@ thread_unblock (struct thread *t)
 
     old_level = intr_disable ();
     ASSERT (t->status == THREAD_BLOCKED);
-    list_push_back (&ready_list, &t->elem);
+
+    // list_push_back (&ready_list, &t->elem);
+    list_insert_ordered(&ready_list, &t->elem, thread_priority_cmp, NULL);
+
     t->status = THREAD_READY;
+    t->age = 0;
+     //if (t != thread_current())
+        //check_preemption();
+
     intr_set_level (old_level);
 }
-
 static void
 update_next_tick_to_wakeup (int64_t tick)
 {
@@ -378,10 +393,13 @@ thread_yield (void)
 
     old_level = intr_disable ();
     if (cur != idle_thread)
-        list_push_back (&ready_list, &cur->elem);
+        // list_push_back (&ready_list, &cur->elem);
+        list_insert_ordered(&ready_list, &cur->elem, thread_priority_cmp, NULL);
+
     cur->status = THREAD_READY;
     schedule ();
     intr_set_level (old_level);
+
 }
 
 /* Invoke function 'func' on all threads, passing along 'aux'.
@@ -406,6 +424,7 @@ void
 thread_set_priority (int new_priority)
 {
     thread_current ()->priority = new_priority;
+    check_preemption ();
 }
 
 /* Returns the current thread's priority. */
@@ -531,6 +550,20 @@ init_thread (struct thread *t, const char *name, int priority)
     t->stack = (uint8_t *)t + PGSIZE;
     t->priority = priority;
     t->magic = THREAD_MAGIC;
+
+    if(thread_mlfqs)
+    {
+        t->queue_level = 0;
+        t->time_slice = 2;
+        t->age = 0;
+    }
+    else
+    {
+        t->priority = priority;
+        t->base_priority = priority;
+        t->age = 0;
+    }
+
     list_push_back (&all_list, &t->allelem);
 }
 
@@ -552,13 +585,36 @@ alloc_frame (struct thread *t, size_t size)
    empty.  (If the running thread can continue running, then it
    will be in the run queue.)  If the run queue is empty, return
    idle_thread. */
+//requirments 3
 static struct thread *
 next_thread_to_run (void)
 {
-    if (list_empty (&ready_list))
-        return idle_thread;
+    if (thread_mlfqs)
+    {
+        if (!list_empty (&mlfqs_ready_list[0]))
+        {
+            return list_entry (list_pop_front (&mlfqs_ready_list[0]), struct thread, elem);
+        }
+        else if (!list_empty (&mlfqs_ready_list[1]))
+        {
+            return list_entry (list_pop_front (&mlfqs_ready_list[1]), struct thread, elem);
+        }
+        else if (!list_empty (&mlfqs_ready_list[2]))
+        {
+            return list_entry (list_pop_front (&mlfqs_ready_list[2]), struct thread, elem);
+        }
+        else
+        {
+            return idle_thread != NULL ? idle_thread : running_thread();
+        }
+    }
     else
-        return list_entry (list_pop_front (&ready_list), struct thread, elem);
+    {
+        if (list_empty (&ready_list))
+            return idle_thread != NULL ? idle_thread : running_thread();
+        else
+            return list_entry (list_pop_front (&ready_list), struct thread, elem);
+    }
 }
 
 /* Completes a thread switch by activating the new thread's page
@@ -647,3 +703,52 @@ allocate_tid (void)
 /* Offset of `stack' member within `struct thread'.
    Used by switch.S, which can't figure it out on its own. */
 uint32_t thread_stack_ofs = offsetof (struct thread, stack);
+
+
+//requirments <1>
+bool
+thread_priority_cmp (const struct list_elem *a,
+                        const struct list_elem *b,
+                        void *aux UNUSED)
+{
+    return list_entry(a, struct thread, elem)->priority
+        > list_entry(b, struct thread, elem)->priority;
+}
+
+void
+check_preemption (void)
+{
+        if (!list_empty(&ready_list) &&
+            thread_current ()->priority <
+
+        list_entry (list_front (&ready_list), struct thread, elem)->priority)
+        
+        thread_yield();
+}
+
+//requirments 2
+void 
+thread_aging(void){
+    struct list_elem *e;
+    
+    for (e = list_begin (&ready_list); e != list_end (&ready_list);)
+    {
+        struct thread *t = list_entry(e, struct thread, elem);
+        e = list_next (e);
+
+        if (t == idle_thread)
+            continue;
+
+        t -> age++;
+
+        if(t->age >= 20 && t->priority < PRI_DEFAULT)
+        {
+            t->priority++;
+            t->age = 0;
+
+            list_remove (&t->elem);
+
+            list_insert_ordered (&ready_list, &t->elem, thread_priority_cmp, NULL);
+        }
+    }
+}
