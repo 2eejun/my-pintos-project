@@ -24,6 +24,10 @@ typedef int tid_t;
 #define PRI_DEFAULT 31 /* Default priority. */
 #define PRI_MAX 63     /* Highest priority. */
 
+#define TIME_SLICE_Q0 2
+#define TIME_SLICE_Q1 4
+#define TIME_SLICE_Q2 8
+
 /* A kernel thread or user process.
 
    Each thread structure is stored in its own 4 kB page.  The
@@ -93,6 +97,7 @@ struct thread
     int age;
     int queue_level;
     int time_slice;
+    int time_slice_used;
 
     /* Shared between thread.c and synch.c. */
     struct list_elem elem; /* List element. */
@@ -139,7 +144,7 @@ void thread_yield (void);
 
 /* Performs some operation on thread t, given auxiliary data AUX. */
 typedef void thread_action_func (struct thread *t, void *aux);
-void thread_foreach (thread_action_func *, void *);
+void thread_foreach (thread_action_func *func, void *aux);
 
 int thread_get_priority (void);
 void thread_set_priority (int);
@@ -154,7 +159,9 @@ bool thread_priority_cmp (const struct list_elem *,
                           void *);
 void check_preemption (void);
 
-
 void thread_aging(void);
+void thread_mlfqs_aging(void);
+void thread_mlfqs_demotion(void);
+
 
 #endif /* threads/thread.h */

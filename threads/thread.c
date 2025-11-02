@@ -26,6 +26,10 @@ static struct list ready_list;
 
 static struct list mlfqs_ready_list[3];
 
+#define ready_list_q0 mlfqs_ready_list[0]
+#define ready_list_q1 mlfqs_ready_list[1]
+#define ready_list_q2 mlfqs_ready_list[2]
+
 /* List of all processes.  Processes are added to this list
    when they are first scheduled and removed when they exit. */
 static struct list all_list;
@@ -100,10 +104,9 @@ thread_init (void)
     list_init (&all_list);
     list_init (&sleep_list);
 
-    list_init (&mlfqs_ready_list[0]);
-    list_init (&mlfqs_ready_list[1]);
-    list_init (&mlfqs_ready_list[2]);
-
+    list_init(&ready_list_q0);
+    list_init(&ready_list_q1);
+    list_init(&ready_list_q2);
     /* Set up a thread structure for the running thread. */
     initial_thread = running_thread ();
     init_thread (initial_thread, "main", PRI_DEFAULT);
@@ -131,26 +134,79 @@ thread_start (void)
 /* Called by the timer interrupt handler at each timer tick.
    Thus, this function runs in an external interrupt context. */
 void
-thread_tick (void)
+thread_foreach (thread_action_func *func, void *aux)
 {
-    struct thread *t = thread_current ();
+    struct list_elem *e;
 
-    /* Update statistics. */
-    if (t == idle_thread)
-        idle_ticks++;
-#ifdef USERPROG
-    else if (t->pagedir != NULL)
-        user_ticks++;
-#endif
-    else
-        kernel_ticks++;
+    ASSERT (intr_get_level () == INTR_OFF);
 
-    /* Enforce preemption. */
-    if (++thread_ticks >= TIME_SLICE)
-        intr_yield_on_return ();
-    if(!list_empty (&ready_list))
-        thread_aging();
+    for (e = list_begin (&all_list); e != list_end (&all_list);
+         e = list_next (e))
+    {
+        struct thread *t = list_entry (e, struct thread, allelem);
+        func (t, aux);
+    }
 }
+void thread_tick(void)
+{
+  struct thread *t = thread_current();
+
+  /* --- 통계 --- */
+  if (t == idle_thread) idle_ticks++;
+#ifdef USERPROG
+  else if (t->pagedir != NULL) user_ticks++;
+#endif
+  else kernel_ticks++;
+
+  /* --- 에이징 --- */
+  if (thread_mlfqs) thread_mlfqs_aging();
+  else if (!list_empty(&ready_list)) thread_aging();
+
+  /* --- 선점/타임슬라이스 --- */
+  if (thread_mlfqs) {
+    if (t != idle_thread) {
+      t->time_slice_used++;
+
+      switch (t->queue_level) {
+      case 0:
+        if (t->time_slice_used >= TIME_SLICE_Q0) {
+          t->time_slice_used = 0;
+          t->queue_level = 1;
+          t->priority = PRI_DEFAULT;
+          intr_yield_on_return();      /* 강등 후 선점 예약 */
+        }
+        break;
+      case 1:
+        if (t->time_slice_used >= TIME_SLICE_Q1) {
+          t->time_slice_used = 0;
+          t->queue_level = 2;
+          t->priority = PRI_MIN;
+          intr_yield_on_return();
+        }
+        break;
+      case 2:
+        if (t->time_slice_used >= TIME_SLICE_Q2) {
+          t->time_slice_used = 0;
+          intr_yield_on_return();      /* 같은 Q2 유지, 라운드로빈 */
+        }
+        break;
+      }
+    }
+
+    /* 더 높은 큐가 비어 있지 않으면 양보 */
+    if (t != idle_thread) {
+      if (t->queue_level > 0 && !list_empty(&ready_list_q0))
+        intr_yield_on_return();
+      else if (t->queue_level > 1 && !list_empty(&ready_list_q1))
+        intr_yield_on_return();
+    }
+  } else {
+    /* 원래 RR/우선순위 모드 */
+    if (++thread_ticks >= TIME_SLICE)
+      intr_yield_on_return();
+  }
+}
+
 
 /* Prints thread statistics. */
 void
@@ -250,26 +306,34 @@ thread_block (void)
    be important: if the caller had disabled interrupts itself,
    it may expect that it can atomically unblock a thread and
    update other data. */
-void
-thread_unblock (struct thread *t)
-{
-    enum intr_level old_level;
 
-    ASSERT (is_thread (t));
+void thread_unblock(struct thread *t) {
+  enum intr_level old_level;
+  bool need_yield = false;
 
-    old_level = intr_disable ();
-    ASSERT (t->status == THREAD_BLOCKED);
+  ASSERT(is_thread(t));
+  old_level = intr_disable();
+  ASSERT(t->status == THREAD_BLOCKED);
 
-    // list_push_back (&ready_list, &t->elem);
+  if (thread_mlfqs) {
+    list_push_back(&mlfqs_ready_list[t->queue_level], &t->elem);
+
+    struct thread *cur = thread_current();
+    if (cur != idle_thread && t->queue_level < cur->queue_level) {
+      if (intr_context()) intr_yield_on_return();
+      else need_yield = true;
+    }
+  } else {
     list_insert_ordered(&ready_list, &t->elem, thread_priority_cmp, NULL);
+  }
 
-    t->status = THREAD_READY;
-    t->age = 0;
-     //if (t != thread_current())
-        //check_preemption();
+  t->status = THREAD_READY;
+  t->age = 0;
+  intr_set_level(old_level);
 
-    intr_set_level (old_level);
+  if (need_yield) thread_yield();
 }
+
 static void
 update_next_tick_to_wakeup (int64_t tick)
 {
@@ -381,8 +445,6 @@ thread_exit (void)
     NOT_REACHED ();
 }
 
-/* Yields the CPU.  The current thread is not put to sleep and
-   may be scheduled again immediately at the scheduler's whim. */
 void
 thread_yield (void)
 {
@@ -392,31 +454,23 @@ thread_yield (void)
     ASSERT (!intr_context ());
 
     old_level = intr_disable ();
-    if (cur != idle_thread)
-        // list_push_back (&ready_list, &cur->elem);
-        list_insert_ordered(&ready_list, &cur->elem, thread_priority_cmp, NULL);
+    
+    cur->status = THREAD_READY; 
 
-    cur->status = THREAD_READY;
+    if (cur != idle_thread)
+    {
+        if (thread_mlfqs)
+        {
+            list_push_back(&mlfqs_ready_list[cur->queue_level], &cur->elem);
+        }
+        else
+        {
+            list_insert_ordered(&ready_list, &cur->elem, thread_priority_cmp, NULL);
+        }
+    }
+
     schedule ();
     intr_set_level (old_level);
-
-}
-
-/* Invoke function 'func' on all threads, passing along 'aux'.
-   This function must be called with interrupts off. */
-void
-thread_foreach (thread_action_func *func, void *aux)
-{
-    struct list_elem *e;
-
-    ASSERT (intr_get_level () == INTR_OFF);
-
-    for (e = list_begin (&all_list); e != list_end (&all_list);
-         e = list_next (e))
-        {
-            struct thread *t = list_entry (e, struct thread, allelem);
-            func (t, aux);
-        }
 }
 
 /* Sets the current thread's priority to NEW_PRIORITY. */
@@ -550,19 +604,17 @@ init_thread (struct thread *t, const char *name, int priority)
     t->stack = (uint8_t *)t + PGSIZE;
     t->priority = priority;
     t->magic = THREAD_MAGIC;
-
-    if(thread_mlfqs)
-    {
-        t->queue_level = 0;
-        t->time_slice = 2;
-        t->age = 0;
-    }
-    else
-    {
-        t->priority = priority;
-        t->base_priority = priority;
-        t->age = 0;
-    }
+ if (thread_mlfqs) {
+    t->queue_level = 0;        
+    t->time_slice_used = 0;
+    t->age = 0;
+    
+    t->priority = PRI_MAX;     
+  } else {
+    t->priority = priority;
+    t->base_priority = priority;
+    t->age = 0;
+  }
 
     list_push_back (&all_list, &t->allelem);
 }
@@ -586,35 +638,26 @@ alloc_frame (struct thread *t, size_t size)
    will be in the run queue.)  If the run queue is empty, return
    idle_thread. */
 //requirments 3
-static struct thread *
-next_thread_to_run (void)
-{
-    if (thread_mlfqs)
-    {
-        if (!list_empty (&mlfqs_ready_list[0]))
-        {
-            return list_entry (list_pop_front (&mlfqs_ready_list[0]), struct thread, elem);
-        }
-        else if (!list_empty (&mlfqs_ready_list[1]))
-        {
-            return list_entry (list_pop_front (&mlfqs_ready_list[1]), struct thread, elem);
-        }
-        else if (!list_empty (&mlfqs_ready_list[2]))
-        {
-            return list_entry (list_pop_front (&mlfqs_ready_list[2]), struct thread, elem);
-        }
-        else
-        {
-            return idle_thread != NULL ? idle_thread : running_thread();
-        }
-    }
-    else
-    {
-        if (list_empty (&ready_list))
-            return idle_thread != NULL ? idle_thread : running_thread();
-        else
-            return list_entry (list_pop_front (&ready_list), struct thread, elem);
-    }
+static struct thread *next_thread_to_run(void) {
+  if (thread_mlfqs) {
+    if (!list_empty(&ready_list_q0))
+      return list_entry(list_pop_front(&ready_list_q0), struct thread, elem);
+
+    if (!list_empty(&ready_list_q1))
+      return list_entry(list_pop_front(&ready_list_q1), struct thread, elem);
+
+    if (!list_empty(&ready_list_q2))
+      return list_entry(list_pop_front(&ready_list_q2), struct thread, elem);
+
+    return idle_thread != NULL ? idle_thread : running_thread();
+
+  } else {
+
+    if (list_empty(&ready_list))
+      return idle_thread != NULL ? idle_thread : running_thread();
+
+    return list_entry(list_pop_front(&ready_list), struct thread, elem);
+  }
 }
 
 /* Completes a thread switch by activating the new thread's page
@@ -640,10 +683,10 @@ thread_schedule_tail (struct thread *prev)
 
     ASSERT (intr_get_level () == INTR_OFF);
 
-    /* Mark us as running. */
+    if (thread_mlfqs && cur != idle_thread) {
+        cur->time_slice_used = 0; 
+    }
     cur->status = THREAD_RUNNING;
-
-    /* Start new time slice. */
     thread_ticks = 0;
 
 #ifdef USERPROG
@@ -699,22 +742,20 @@ allocate_tid (void)
 
     return tid;
 }
-
-/* Offset of `stack' member within `struct thread'.
-   Used by switch.S, which can't figure it out on its own. */
-uint32_t thread_stack_ofs = offsetof (struct thread, stack);
-
-
 //requirments <1>
 bool
 thread_priority_cmp (const struct list_elem *a,
-                        const struct list_elem *b,
-                        void *aux UNUSED)
+                     const struct list_elem *b,
+                     void *aux UNUSED)
 {
-    return list_entry(a, struct thread, elem)->priority
-        > list_entry(b, struct thread, elem)->priority;
-}
+    const struct thread *ta = list_entry(a, struct thread, elem);
+    const struct thread *tb = list_entry(b, struct thread, elem);
 
+    if (ta->priority != tb->priority)
+        return ta->priority > tb->priority;  
+    return false;  
+
+}
 void
 check_preemption (void)
 {
@@ -752,3 +793,74 @@ thread_aging(void){
         }
     }
 }
+void thread_mlfqs_demotion(void)
+{
+    struct thread *cur = thread_current();
+
+    if (cur == idle_thread)
+        return;
+
+    if (cur->queue_level < 2)
+        cur->queue_level++;
+
+    cur->time_slice = (cur->queue_level == 0) ? 2 :
+                      (cur->queue_level == 1) ? 4 : 8;
+
+    list_push_front(&mlfqs_ready_list[cur->queue_level], &cur->elem);
+   
+    intr_yield_on_return();
+}
+
+void thread_mlfqs_aging(void) {
+  struct list_elem *e;
+
+  for (e = list_begin(&ready_list_q0); e != list_end(&ready_list_q0); e = list_next(e)) {
+    struct thread *t = list_entry(e, struct thread, elem);
+    if (t == idle_thread) continue;
+    t->age++;
+    if (t->age >= 20) t->age = 0;
+  }
+
+  e = list_begin(&ready_list_q1);
+  while (e != list_end(&ready_list_q1)) {
+    struct thread *t = list_entry(e, struct thread, elem);
+    struct list_elem *next = list_next(e);
+    if (t != idle_thread) {
+      t->age++;
+      if (t->age >= 20) {
+        t->age = 0;
+        t->queue_level = 0;
+        t->priority = PRI_MAX;
+        list_remove(e);
+        list_push_back(&ready_list_q0, &t->elem);
+        e = next;
+        continue;
+      }
+    }
+    e = next;
+  }
+
+  e = list_begin(&ready_list_q2);
+  while (e != list_end(&ready_list_q2)) {
+    struct thread *t = list_entry(e, struct thread, elem);
+    struct list_elem *next = list_next(e);
+    if (t != idle_thread) {
+      t->age++;
+      if (t->age >= 20) {
+        t->age = 0;
+        t->queue_level = 1;
+        t->priority = PRI_DEFAULT;
+        list_remove(e);
+        list_push_back(&ready_list_q1, &t->elem);
+        e = next;
+        continue;
+      }
+    }
+    e = next;
+  }
+}
+
+/* Offset of `stack' member within `struct thread'.
+   Used by switch.S, which can't figure it out on its own. */
+
+uint32_t thread_stack_ofs = offsetof (struct thread, stack);
