@@ -157,7 +157,6 @@ void thread_tick(void)
 #endif
   else kernel_ticks++;
 
-
   if (thread_mlfqs) thread_mlfqs_aging();
   else if (!list_empty(&ready_list)) thread_aging();
 
