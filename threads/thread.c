@@ -151,18 +151,16 @@ void thread_tick(void)
 {
   struct thread *t = thread_current();
 
-  /* --- 통계 --- */
   if (t == idle_thread) idle_ticks++;
 #ifdef USERPROG
   else if (t->pagedir != NULL) user_ticks++;
 #endif
   else kernel_ticks++;
 
-  /* --- 에이징 --- */
+
   if (thread_mlfqs) thread_mlfqs_aging();
   else if (!list_empty(&ready_list)) thread_aging();
 
-  /* --- 선점/타임슬라이스 --- */
   if (thread_mlfqs) {
     if (t != idle_thread) {
       t->time_slice_used++;
@@ -173,7 +171,7 @@ void thread_tick(void)
           t->time_slice_used = 0;
           t->queue_level = 1;
           t->priority = PRI_DEFAULT;
-          intr_yield_on_return();      /* 강등 후 선점 예약 */
+          intr_yield_on_return();   
         }
         break;
       case 1:
@@ -187,13 +185,12 @@ void thread_tick(void)
       case 2:
         if (t->time_slice_used >= TIME_SLICE_Q2) {
           t->time_slice_used = 0;
-          intr_yield_on_return();      /* 같은 Q2 유지, 라운드로빈 */
+          intr_yield_on_return();     
         }
         break;
       }
     }
 
-    /* 더 높은 큐가 비어 있지 않으면 양보 */
     if (t != idle_thread) {
       if (t->queue_level > 0 && !list_empty(&ready_list_q0))
         intr_yield_on_return();
@@ -201,7 +198,6 @@ void thread_tick(void)
         intr_yield_on_return();
     }
   } else {
-    /* 원래 RR/우선순위 모드 */
     if (++thread_ticks >= TIME_SLICE)
       intr_yield_on_return();
   }
@@ -767,7 +763,7 @@ check_preemption (void)
         thread_yield();
 }
 
-//requirments 2
+//requirments <2>
 void 
 thread_aging(void){
     struct list_elem *e;
